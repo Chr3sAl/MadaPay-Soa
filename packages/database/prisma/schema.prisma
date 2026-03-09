@@ -1,0 +1,104 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Language {
+  en
+  fr
+  mg
+}
+
+enum QuoteMode {
+  MGA_TOTAL_INCLUDING_FEE
+  CNY_TARGET_EXACT
+}
+
+enum PayoutMethod {
+  ALIPAY
+  WECHAT_PAY
+}
+
+enum TransactionStatus {
+  QUOTE_CREATED
+  QUOTE_CONFIRMED
+  AWAITING_QR
+  AWAITING_TRANSFER_ID
+  READY_FOR_HANDOFF
+  AWAITING_HUMAN
+  IN_PROGRESS
+  SUCCESS
+  FAILED
+  EXPIRED
+  CANCELLED
+}
+
+model Customer {
+  id            String        @id @default(cuid())
+  messengerPsid String        @unique
+  language      Language?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  transactions  Transaction[]
+}
+
+model ExchangeRate {
+  id        String   @id @default(cuid())
+  from      String
+  to        String
+  rate      Decimal  @db.Decimal(18, 6)
+  isActive  Boolean  @default(true)
+  startsAt  DateTime @default(now())
+  endsAt    DateTime?
+  createdAt DateTime @default(now())
+}
+
+model FeeRule {
+  id           String   @id @default(cuid())
+  channel      String
+  minAmountMga Int
+  maxAmountMga Int
+  feeAmountMga Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+}
+
+model Transaction {
+  id                   String            @id @default(cuid())
+  customerId           String
+  language             Language?
+  quoteMode            QuoteMode
+  inputAmount          Decimal           @db.Decimal(18, 2)
+  inputCurrency        String
+  exchangeableMga      Decimal           @db.Decimal(18, 2)
+  feeAmountMga         Decimal           @db.Decimal(18, 2)
+  totalToPayMga        Decimal           @db.Decimal(18, 2)
+  destinationAmountCny Decimal           @db.Decimal(18, 2)
+  appliedRate          Decimal           @db.Decimal(18, 6)
+  payoutMethod         PayoutMethod?
+  qrImagePath          String?
+  transferId           String?
+  receiptImagePath     String?
+  status               TransactionStatus @default(QUOTE_CREATED)
+  failureReason        String?
+  confirmedAt          DateTime?
+  expiresAt            DateTime?
+  handedOffAt          DateTime?
+  completedAt          DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id])
+}
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+}
