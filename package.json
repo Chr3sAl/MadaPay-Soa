@@ -8,10 +8,6 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "packageManager": "pnpm@10.31.0",
-  "dependencies": {
-    "@prisma/client": "^6.19.0",
-    "prisma": "^6.19.0"
-  }
+  "license": "ISC"
 }
+
