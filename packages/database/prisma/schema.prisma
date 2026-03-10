@@ -26,73 +26,109 @@ enum PayoutMethod {
 enum TransactionStatus {
   QUOTE_CREATED
   QUOTE_CONFIRMED
+  WAITING_FOR_QR
   AWAITING_QR
   AWAITING_TRANSFER_ID
   READY_FOR_HANDOFF
   AWAITING_HUMAN
+  PENDING_HUMAN
   IN_PROGRESS
+  COMPLETED
   SUCCESS
   FAILED
   EXPIRED
   CANCELLED
 }
 
+enum BotLanguage {
+  FR
+  MG
+  EN
+}
+
+enum ConversationStep {
+  CHOOSE_LANGUAGE
+  ENTER_AMOUNT
+  CONFIRM_QUOTE
+  WAITING_FOR_QR
+  HANDOFF_TO_AGENT
+  EXPIRED
+}
+
 model Customer {
   id            String        @id @default(cuid())
-  messengerPsid String        @unique
+  fullName      String?
+  messengerPsid String?       @unique
+  phone         String?
   language      Language?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
+
   transactions  Transaction[]
 }
 
 model ExchangeRate {
-  id        String   @id @default(cuid())
+  id        String   @id
   from      String
   to        String
   rate      Decimal  @db.Decimal(18, 6)
   isActive  Boolean  @default(true)
-  startsAt  DateTime @default(now())
+  startsAt  DateTime
   endsAt    DateTime?
   createdAt DateTime @default(now())
 }
 
 model FeeRule {
-  id           String   @id @default(cuid())
+  id           String   @id
   channel      String
-  minAmountMga Int
-  maxAmountMga Int
   feeAmountMga Int
+  maxAmountMga Int
+  minAmountMga Int
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
 }
 
 model Transaction {
-  id                   String            @id @default(cuid())
-  customerId           String
-  language             Language?
-  quoteMode            QuoteMode
-  inputAmount          Decimal           @db.Decimal(18, 2)
-  inputCurrency        String
-  exchangeableMga      Decimal           @db.Decimal(18, 2)
-  feeAmountMga         Decimal           @db.Decimal(18, 2)
-  totalToPayMga        Decimal           @db.Decimal(18, 2)
-  destinationAmountCny Decimal           @db.Decimal(18, 2)
-  appliedRate          Decimal           @db.Decimal(18, 6)
-  payoutMethod         PayoutMethod?
-  qrImagePath          String?
-  transferId           String?
-  receiptImagePath     String?
-  status               TransactionStatus @default(QUOTE_CREATED)
-  failureReason        String?
-  confirmedAt          DateTime?
-  expiresAt            DateTime?
-  handedOffAt          DateTime?
-  completedAt          DateTime?
-  createdAt            DateTime          @default(now())
-  updatedAt            DateTime          @updatedAt
+  id                       String            @id @default(cuid())
+  customerId               String?
+  language                 Language?
+  quoteMode                QuoteMode
+  inputAmount              Decimal           @db.Decimal(18, 2)
+  inputCurrency            String
+  exchangeableMga          Decimal           @db.Decimal(18, 2)
+  feeAmountMga             Decimal           @db.Decimal(18, 2)
+  totalToPayMga            Decimal           @db.Decimal(18, 2)
+  destinationAmountCny     Decimal           @db.Decimal(18, 2)
+  appliedRate              Decimal           @db.Decimal(18, 6)
+  payoutMethod             PayoutMethod?
+  qrImagePath              String?
+  receiptImagePath         String?
+  transferId               String?
+  status                   TransactionStatus @default(QUOTE_CREATED)
+  failureReason            String?
+  confirmedAt              DateTime?
+  expiresAt                DateTime?
+  handedOffAt              DateTime?
+  completedAt              DateTime?
+  createdAt                DateTime          @default(now())
+  updatedAt                DateTime          @updatedAt
 
-  customer Customer @relation(fields: [customerId], references: [id])
+  customer Customer? @relation(fields: [customerId], references: [id])
+}
+
+model MessengerSession {
+  id            String           @id @default(cuid())
+  messengerPsid String           @unique
+  language      BotLanguage?
+  step          ConversationStep @default(CHOOSE_LANGUAGE)
+  amountMga     Decimal?         @db.Decimal(18, 2)
+  feeAmountMga  Decimal?         @db.Decimal(18, 2)
+  cnyAmount     Decimal?         @db.Decimal(18, 2)
+  quoteRate     Decimal?         @db.Decimal(18, 6)
+  qrImageUrl    String?
+  expiresAt     DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 }
 
 model AdminUser {

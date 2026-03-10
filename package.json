@@ -8,6 +8,9 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "devDependencies": {
+    "@prisma/client": "6.19.0",
+    "prisma": "^6.19.0"
+  }
 }
-
