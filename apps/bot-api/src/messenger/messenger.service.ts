@@ -1,4 +1,9 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { PrismaService } from '../db/prisma.service';
 import { QuotesService } from '../quotes/quotes.service';
 
@@ -150,6 +155,80 @@ export class MessengerService {
     }
   }
 
+  async resolveAgentWorkflow(input: {
+    transactionId: string;
+    transferIdVerified: boolean;
+    amountVerified: boolean;
+    payoutSent: boolean;
+    result: 'SUCCESS' | 'FAILED';
+    failureReason?: string;
+  }) {
+    const {
+      transactionId,
+      transferIdVerified,
+      amountVerified,
+      payoutSent,
+      result,
+      failureReason,
+    } = input;
+
+    if (!transactionId) {
+      throw new BadRequestException('transactionId is required');
+    }
+
+    const checksPassed = transferIdVerified && amountVerified && payoutSent;
+
+    if (result === 'SUCCESS' && !checksPassed) {
+      throw new BadRequestException(
+        'Cannot mark SUCCESS unless transferIdVerified, amountVerified and payoutSent are true',
+      );
+    }
+
+    const transaction = await this.prisma.transaction.findUnique({
+      where: { id: transactionId },
+      include: { customer: true },
+    });
+
+    if (!transaction) {
+      throw new NotFoundException('Transaction not found');
+    }
+
+    const finalized = await this.prisma.transaction.update({
+      where: { id: transactionId },
+      data: {
+        status: result,
+        completedAt: new Date(),
+        failureReason:
+          result === 'FAILED'
+            ? failureReason || 'Failed by agent review'
+            : null,
+      },
+    });
+
+    const psid = transaction.customer?.messengerPsid;
+    if (psid) {
+      const language = await this.getCustomerLanguage(psid);
+      await this.sendFinalStatusMessage(
+        psid,
+        language,
+        result,
+        finalized.transferId || undefined,
+        finalized.failureReason || undefined,
+      );
+    }
+
+    return {
+      status: 'UPDATED',
+      transactionId: finalized.id,
+      result: finalized.status,
+      checklist: {
+        transferIdVerified,
+        amountVerified,
+        payoutSent,
+      },
+      customerNotified: Boolean(psid),
+    };
+  }
   private async handleLanguageSelection(
     senderId: string,
     normalized: string,
@@ -656,6 +735,42 @@ Alefaso amin'ity laharana Mobile Money ity ny vola: ${mobileMoneyNumber}`,
     );
   }
 
+  private async getCustomerLanguage(
+    senderId: string,
+  ): Promise<SupportedLanguage> {
+    const session = await this.prisma.messengerSession.findUnique({
+      where: { messengerPsid: senderId },
+      select: { language: true },
+    });
+
+    return (session?.language as SupportedLanguage) || 'EN';
+  }
+
+  private async sendFinalStatusMessage(
+    senderId: string,
+    language: SupportedLanguage,
+    result: 'SUCCESS' | 'FAILED',
+    transferId?: string,
+    failureReason?: string,
+  ) {
+    const successText: Record<SupportedLanguage, string> = {
+      EN: `✅ Payment completed successfully.${transferId ? `\nTransfer ID: ${transferId}` : ''}\nThank you for using MadaPay.`,
+      FR: `✅ Paiement effectué avec succès.${transferId ? `\nID de transfert : ${transferId}` : ''}\nMerci d'avoir utilisé MadaPay.`,
+      MG: `✅ Vita soa aman-tsara ny fandoavana.${transferId ? `\nID transfert: ${transferId}` : ''}\nMisaotra nampiasa MadaPay.`,
+    };
+
+    const failedText: Record<SupportedLanguage, string> = {
+      EN: `❌ Your transaction could not be completed.${failureReason ? `\nReason: ${failureReason}` : ''}\nPlease contact support or send START to retry.`,
+      FR: `❌ Votre transaction n'a pas pu être finalisée.${failureReason ? `\nRaison : ${failureReason}` : ''}\nVeuillez contacter le support ou envoyer START pour réessayer.`,
+      MG: `❌ Tsy tafavita ny transaction-nao.${failureReason ? `\nAntony: ${failureReason}` : ''}\nMifandraisa amin'ny support na alefaso START raha hamerina.`,
+    };
+
+    await this.sendTextMessage(
+      senderId,
+      result === 'SUCCESS' ? successText[language] : failedText[language],
+      this.getResetQuickReply(language),
+    );
+  }
   private getResetQuickReply(language: SupportedLanguage) {
     const resetLabels: Record<SupportedLanguage, string> = {
       EN: 'Reset',

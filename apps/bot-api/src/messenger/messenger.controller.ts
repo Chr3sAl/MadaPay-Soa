@@ -18,4 +18,19 @@ export class MessengerController {
   async handleWebhook(@Body() body: any) {
     return this.messengerService.handleWebhook(body);
   }
+
+  @Post('agent/resolve')
+  async resolveAgentWorkflow(
+    @Body()
+    body: {
+      transactionId: string;
+      transferIdVerified: boolean;
+      amountVerified: boolean;
+      payoutSent: boolean;
+      result: 'SUCCESS' | 'FAILED';
+      failureReason?: string;
+    },
+  ) {
+    return this.messengerService.resolveAgentWorkflow(body);
+  }
 }
