@@ -30,11 +30,12 @@ export class MessengerService {
       for (const event of entry.messaging || []) {
         const senderId = event.sender?.id;
         const text = event.message?.text?.trim();
+        const quickReplyPayload = event.message?.quick_reply?.payload?.trim();
         const attachments = event.message?.attachments || [];
 
         if (!senderId) continue;
-        if (text) {
-          await this.handleIncomingText(senderId, text);
+        if (text || quickReplyPayload) {
+          await this.handleIncomingText(senderId, quickReplyPayload || text);
           continue;
         }
 
@@ -87,21 +88,25 @@ export class MessengerService {
       return;
     }
 
-    if (normalized === 'START') {
-      await this.prisma.messengerSession.update({
-        where: { messengerPsid: senderId },
-        data: {
-          language: null,
-          step: 'CHOOSE_LANGUAGE',
-          amountMga: null,
-          feeAmountMga: null,
-          cnyAmount: null,
-          quoteRate: null,
-          expiresAt: null,
-          qrImageUrl: null,
-        },
-      });
+    const resetValues = ['START', 'RESET', 'RESTART'];
+    if (resetValues.includes(normalized)) {
+      await this.resetSession(senderId);
+      await this.sendLanguagePrompt(senderId);
+      return;
+    }
 
+    const greetingValues = [
+      'HI',
+      'HELLO',
+      'HEY',
+      'BONJOUR',
+      'SALUT',
+      'MANAO AHOANA',
+    ];
+    if (
+      greetingValues.includes(normalized) &&
+      (!session.language || session.step === 'CHOOSE_LANGUAGE')
+    ) {
       await this.sendLanguagePrompt(senderId);
       return;
     }
@@ -128,6 +133,11 @@ export class MessengerService {
         return;
 
       case 'HANDOFF_TO_AGENT':
+        if (session.expiresAt) {
+          await this.handleTransferIdInput(senderId, text, session);
+          return;
+        }
+
         await this.sendLocalizedMessage(
           senderId,
           (session.language as SupportedLanguage) || 'EN',
@@ -228,6 +238,7 @@ export class MessengerService {
         },
       });
 
+      await this.createOrUpdateAwaitingQrTransaction(senderId, session);
       await this.sendLocalizedMessage(senderId, language, 'ask_qr');
       return;
     }
@@ -270,6 +281,15 @@ export class MessengerService {
       (attachment) => attachment?.type === 'image' && attachment?.payload?.url,
     );
 
+    if (session.step === 'HANDOFF_TO_AGENT' && session.expiresAt) {
+      await this.sendLocalizedMessage(
+        senderId,
+        language,
+        'waiting_transfer_id_text_only',
+      );
+      return;
+    }
+
     if (session.step !== 'WAITING_FOR_QR') {
       await this.sendLocalizedMessage(senderId, language, 'unexpected_image');
       return;
@@ -291,9 +311,171 @@ export class MessengerService {
       },
     });
 
+    await this.markTransactionAwaitingTransferId(
+      senderId,
+      imageAttachment.payload.url,
+    );
+
     await this.sendLocalizedMessage(senderId, language, 'transfer_number');
+    await this.sendLocalizedMessage(senderId, language, 'ask_transfer_id');
+  }
+
+  private async handleTransferIdInput(
+    senderId: string,
+    text: string,
+    session: any,
+  ) {
+    const language = (session.language as SupportedLanguage) || 'EN';
+    const transferId = text.trim().replace(/\s+/g, '').toUpperCase();
+
+    if (!/^[A-Z0-9-]{4,}$/.test(transferId)) {
+      await this.sendLocalizedMessage(
+        senderId,
+        language,
+        'invalid_transfer_id',
+      );
+      return;
+    }
+
+    await this.prisma.messengerSession.update({
+      where: { messengerPsid: senderId },
+      data: {
+        expiresAt: null,
+      },
+    });
+
+    await this.markTransactionReadyForHandoff(senderId, transferId);
+
+    await this.sendLocalizedMessage(senderId, language, 'transfer_id_received');
     await this.sendLocalizedMessage(senderId, language, 'handoff_notice');
-    await this.handoffToHumanAgent(senderId);
+    await this.handoffToHumanAgent(senderId, transferId);
+  }
+
+  private async createOrUpdateAwaitingQrTransaction(
+    senderId: string,
+    session: any,
+  ) {
+    const customer = await this.ensureCustomer(senderId);
+
+    const inputAmount = Number(session.amountMga || 0);
+    const feeAmount = Number(session.feeAmountMga || 0);
+    const destinationAmount = Number(session.cnyAmount || 0);
+    const appliedRate = Number(session.quoteRate || 0);
+    const exchangeableMga = Number((inputAmount - feeAmount).toFixed(2));
+
+    const existing = await this.prisma.transaction.findFirst({
+      where: {
+        customerId: customer.id,
+        status: {
+          in: ['QUOTE_CONFIRMED', 'WAITING_FOR_QR', 'AWAITING_TRANSFER_ID'],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (existing) {
+      await this.prisma.transaction.update({
+        where: { id: existing.id },
+        data: {
+          status: 'WAITING_FOR_QR',
+          confirmedAt: new Date(),
+          expiresAt: session.expiresAt || null,
+          inputAmount,
+          exchangeableMga,
+          feeAmountMga: feeAmount,
+          totalToPayMga: inputAmount,
+          destinationAmountCny: destinationAmount,
+          appliedRate,
+        },
+      });
+      return;
+    }
+
+    await this.prisma.transaction.create({
+      data: {
+        customerId: customer.id,
+        quoteMode: 'MGA_TOTAL_INCLUDING_FEE',
+        inputAmount,
+        inputCurrency: 'MGA',
+        exchangeableMga,
+        feeAmountMga: feeAmount,
+        totalToPayMga: inputAmount,
+        destinationAmountCny: destinationAmount,
+        appliedRate,
+        status: 'WAITING_FOR_QR',
+        confirmedAt: new Date(),
+        expiresAt: session.expiresAt || null,
+      },
+    });
+  }
+
+  private async markTransactionAwaitingTransferId(
+    senderId: string,
+    qrImageUrl: string,
+  ) {
+    const customer = await this.ensureCustomer(senderId);
+
+    const transaction = await this.prisma.transaction.findFirst({
+      where: {
+        customerId: customer.id,
+        status: {
+          in: ['WAITING_FOR_QR', 'QUOTE_CONFIRMED'],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!transaction) return;
+
+    await this.prisma.transaction.update({
+      where: { id: transaction.id },
+      data: {
+        status: 'AWAITING_TRANSFER_ID',
+        qrImagePath: qrImageUrl,
+      },
+    });
+  }
+
+  private async markTransactionReadyForHandoff(
+    senderId: string,
+    transferId: string,
+  ) {
+    const customer = await this.ensureCustomer(senderId);
+
+    const transaction = await this.prisma.transaction.findFirst({
+      where: {
+        customerId: customer.id,
+        status: {
+          in: ['AWAITING_TRANSFER_ID', 'WAITING_FOR_QR'],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!transaction) return;
+
+    await this.prisma.transaction.update({
+      where: { id: transaction.id },
+      data: {
+        transferId,
+        status: 'READY_FOR_HANDOFF',
+        handedOffAt: new Date(),
+      },
+    });
+  }
+
+  private async ensureCustomer(senderId: string) {
+    const existingCustomer = await this.prisma.customer.findUnique({
+      where: { messengerPsid: senderId },
+    });
+
+    if (existingCustomer) return existingCustomer;
+
+    return this.prisma.customer.create({
+      data: {
+        messengerPsid: senderId,
+      },
+    });
   }
 
   private isExpired(expiresAt?: Date | null) {
@@ -304,7 +486,21 @@ export class MessengerService {
   private async sendLanguagePrompt(senderId: string) {
     await this.sendTextMessage(
       senderId,
-      `Choose language / Choisissez la langue / Fidio ny fiteny:\n\nFR - Français\nMG - Malagasy\nEN - English`,
+      `Choose language / Choisissez la langue / Fidio ny fiteny:
+
+FR - Français
+MG - Malagasy
+EN - English`,
+      [
+        { content_type: 'text', title: 'FR', payload: 'FR' },
+        { content_type: 'text', title: 'MG', payload: 'MG' },
+        { content_type: 'text', title: 'EN', payload: 'EN' },
+        {
+          content_type: 'text',
+          title: 'Reset / Réinitialiser / Avereno',
+          payload: 'START',
+        },
+      ],
     );
   }
 
@@ -343,7 +539,11 @@ export class MessengerService {
         `Lany daty ao anatin'ny 20 minitra ity kajy ity.`,
     };
 
-    await this.sendTextMessage(senderId, messages[language]);
+    await this.sendTextMessage(
+      senderId,
+      messages[language],
+      this.getResetQuickReply(language),
+    );
   }
 
   private async sendLocalizedMessage(
@@ -358,6 +558,10 @@ export class MessengerService {
       | 'waiting_qr_text_only'
       | 'invalid_qr'
       | 'transfer_number'
+      | 'ask_transfer_id'
+      | 'invalid_transfer_id'
+      | 'transfer_id_received'
+      | 'waiting_transfer_id_text_only'
       | 'handoff_notice'
       | 'unexpected_image',
   ) {
@@ -376,9 +580,18 @@ export class MessengerService {
         waiting_qr_text_only: 'Please upload a QR code image, not text.',
         invalid_qr:
           'I could not read that image. Please send a clear Alipay or WeChat Pay QR code.',
-        transfer_number: `QR received ✅\nPlease transfer the funds to this Mobile Money number: ${mobileMoneyNumber}`,
+        transfer_number: `QR received ✅
+Please transfer the funds to this Mobile Money number: ${mobileMoneyNumber}`,
+        ask_transfer_id:
+          'After payment, please send your Mobile Money transfer ID here (example: MM123456).',
+        invalid_transfer_id:
+          'Please send a valid transfer ID using letters/numbers only (minimum 4 characters).',
+        transfer_id_received:
+          'Transfer ID received ✅. Thank you! We are now connecting you to a human agent for final verification.',
+        waiting_transfer_id_text_only:
+          'Please send your transfer ID as text (not an image).',
         handoff_notice:
-          'Your chat has been handed to a human agent. They will continue with you shortly. This step expires in 20 minutes.',
+          'Your chat has been handed to a human agent. They will continue with you shortly.',
         unexpected_image:
           'Image received. Please follow the current step or send START to restart.',
       },
@@ -395,9 +608,18 @@ export class MessengerService {
           'Veuillez envoyer une image du QR code, pas un texte.',
         invalid_qr:
           'Je ne peux pas lire cette image. Veuillez envoyer un QR code Alipay ou WeChat Pay clair.',
-        transfer_number: `QR reçu ✅\nVeuillez transférer les fonds vers ce numéro Mobile Money : ${mobileMoneyNumber}`,
+        transfer_number: `QR reçu ✅
+Veuillez transférer les fonds vers ce numéro Mobile Money : ${mobileMoneyNumber}`,
+        ask_transfer_id:
+          'Après le paiement, veuillez envoyer votre ID de transfert Mobile Money ici (exemple : MM123456).',
+        invalid_transfer_id:
+          'Veuillez envoyer un ID de transfert valide avec lettres/chiffres uniquement (minimum 4 caractères).',
+        transfer_id_received:
+          'ID de transfert reçu ✅. Merci ! Nous vous connectons maintenant à un agent humain pour la vérification finale.',
+        waiting_transfer_id_text_only:
+          'Veuillez envoyer votre ID de transfert en texte (pas une image).',
         handoff_notice:
-          'Votre conversation est transférée à un agent humain. Il vous répondra sous peu. Cette étape expire dans 20 minutes.',
+          'Votre conversation est transférée à un agent humain. Il vous répondra sous peu.',
         unexpected_image:
           "Image reçue. Veuillez suivre l'étape en cours ou envoyer START pour recommencer.",
       },
@@ -410,18 +632,63 @@ export class MessengerService {
         waiting_qr_text_only: 'Alefaso sary QR code fa tsy soratra.',
         invalid_qr:
           'Tsy voavaky ilay sary. Alefaso azafady QR code Alipay na WeChat Pay mazava.',
-        transfer_number: `Voaray ny QR ✅\nAlefaso amin'ity laharana Mobile Money ity ny vola: ${mobileMoneyNumber}`,
+        transfer_number: `Voaray ny QR ✅
+Alefaso amin'ity laharana Mobile Money ity ny vola: ${mobileMoneyNumber}`,
+        ask_transfer_id:
+          'Rehefa avy mandoa dia alefaso eto ny ID transfert Mobile Money (ohatra: MM123456).',
+        invalid_transfer_id:
+          'Alefaso azafady ID transfert marina misy litera/isa ihany (farafahakeliny 4 tarehintsoratra).',
+        transfer_id_received:
+          "Voaray ny ID transfert ✅. Misaotra! Ampifandraisinay amin'ny mpiasa tena izy ianao ho an'ny fanamarinana farany.",
+        waiting_transfer_id_text_only:
+          "Alefaso amin'ny soratra ny ID transfert (fa tsy sary).",
         handoff_notice:
-          "Nafindra amin'ny mpiasa tena izy ny resaka. Hamaly anao tsy ho ela izy. Lany daty ao anatin'ny 20 minitra ity dingana ity.",
+          "Nafindra amin'ny mpiasa tena izy ny resaka. Hamaly anao tsy ho ela izy.",
         unexpected_image:
           'Voaray ny sary. Araho azafady ny dingana ankehitriny na alefaso START hanombohana indray.',
       },
     };
 
-    await this.sendTextMessage(senderId, messages[language][key]);
+    await this.sendTextMessage(
+      senderId,
+      messages[language][key],
+      this.getResetQuickReply(language),
+    );
   }
 
-  private async handoffToHumanAgent(recipientId: string) {
+  private getResetQuickReply(language: SupportedLanguage) {
+    const resetLabels: Record<SupportedLanguage, string> = {
+      EN: 'Reset',
+      FR: 'Réinitialiser',
+      MG: 'Avereno',
+    };
+
+    return [
+      {
+        content_type: 'text' as const,
+        title: resetLabels[language],
+        payload: 'START',
+      },
+    ];
+  }
+
+  private async resetSession(senderId: string) {
+    await this.prisma.messengerSession.update({
+      where: { messengerPsid: senderId },
+      data: {
+        language: null,
+        step: 'CHOOSE_LANGUAGE',
+        amountMga: null,
+        feeAmountMga: null,
+        cnyAmount: null,
+        quoteRate: null,
+        expiresAt: null,
+        qrImageUrl: null,
+      },
+    });
+  }
+
+  private async handoffToHumanAgent(recipientId: string, transferId?: string) {
     const token = process.env.META_PAGE_ACCESS_TOKEN;
     const targetAppId = process.env.META_SECONDARY_RECEIVER_APP_ID;
 
@@ -436,7 +703,9 @@ export class MessengerService {
           body: JSON.stringify({
             recipient: { id: recipientId },
             target_app_id: Number(targetAppId),
-            metadata: 'handoff_after_qr',
+            metadata: transferId
+              ? `handoff_after_transfer_id:${transferId}`
+              : 'handoff_after_transfer_id',
           }),
         },
       );
@@ -445,7 +714,15 @@ export class MessengerService {
     }
   }
 
-  private async sendTextMessage(recipientId: string, text: string) {
+  private async sendTextMessage(
+    recipientId: string,
+    text: string,
+    quickReplies?: Array<{
+      content_type: 'text';
+      title: string;
+      payload: string;
+    }>,
+  ) {
     const token = process.env.META_PAGE_ACCESS_TOKEN;
 
     if (!token) return;
@@ -458,7 +735,10 @@ export class MessengerService {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             recipient: { id: recipientId },
-            message: { text },
+            message: {
+              text,
+              ...(quickReplies ? { quick_replies: quickReplies } : {}),
+            },
           }),
         },
       );

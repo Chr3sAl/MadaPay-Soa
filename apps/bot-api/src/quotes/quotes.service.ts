@@ -25,6 +25,7 @@ export class QuotesService {
     if (input.mode === 'MGA_TOTAL_INCLUDING_FEE') {
       const feeRule = await this.prisma.feeRule.findFirst({
         where: {
+          id: { startsWith: 'fee_other_' },
           channel: 'OTHER_OPERATORS',
           isActive: true,
           minAmountMga: { lte: Math.floor(input.amount) },
@@ -55,6 +56,7 @@ export class QuotesService {
 
     const feeRule = await this.prisma.feeRule.findFirst({
       where: {
+        id: { startsWith: 'fee_other_' },
         channel: 'OTHER_OPERATORS',
         isActive: true,
         minAmountMga: { lte: Math.floor(rawMgaNeeded) },
